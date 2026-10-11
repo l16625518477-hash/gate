@@ -36,12 +36,14 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
+VPNGATE_API = os.environ.get("VPNGATE_API", "https://www.vpngate.net/api/iphone/")
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
+# 检测 Worker 鉴权 token（与 Worker 侧 env.TOKEN 一致，见 worker-auth-snippet.js）
+CHECK_TOKEN = os.environ.get("CHECK_TOKEN", "").strip()
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
@@ -96,6 +98,9 @@ EDGE_HOSTS = [
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
 
 NODES_URL = os.environ.get("NODES_URL", "https://YOUR_GITHUB_USERNAME.github.io/gate/nodes.txt")
+
+# 优选 API 返回的合法端点格式：IP/域名:端口（拒绝第三方源注入的异常行）
+_ENDPOINT_RE = re.compile(r"^[A-Za-z0-9.\-]+:\d{1,5}$")
 
 # ---------------------------------------------------------------------------
 # 日志
@@ -241,6 +246,13 @@ def fetch_optimal_api_endpoints(api_urls_str):
                         # 补充缺失端口默认 443
                         if ":" not in endpoint:
                             endpoint = f"{endpoint}:443"
+                        # 格式校验：只接受 IP/域名:端口，拒绝第三方源注入的异常行
+                        # （IPv6 不在支持范围，会被跳过）
+                        if not _ENDPOINT_RE.match(endpoint):
+                            continue
+                        _port = int(endpoint.rsplit(":", 1)[1])
+                        if not (1 <= _port <= 65535):
+                            continue
                         endpoints.append(endpoint)
                         count += 1
                 log("OPTIMAL API", f"成功从 API 获取到 {count} 个优选端点")
@@ -270,7 +282,10 @@ def get_combined_edge_hosts():
             combined.append(h)
 
     log("EDGE POOL", f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 合并有效入口共 {len(combined)} 个")
-    return combined if combined else EDGE_HOSTS
+    if not combined:
+        # 原逻辑回退到同样为空的 EDGE_HOSTS，随后在 build_nodes_text 里除零崩溃，不如提前明确失败
+        die("入口地址池为空：EDGE_HOSTS 与 OPTIMAL_API 均未提供有效入口，请检查 Secrets")
+    return combined
 
 # ---------------------------------------------------------------------------
 # 筛选 SSTP 节点
@@ -325,6 +340,9 @@ def classify_network(host, exit_org, is_datacenter=None):
 
 def check_one(node, session):
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    if CHECK_TOKEN:
+        # WORKER_CHECK_URL 本身已带 ?sstp=，token 用 & 拼接
+        url += "&token=" + quote(CHECK_TOKEN, safe="")
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -469,6 +487,9 @@ def write_outputs(data, edge_hosts):
 # main
 # ---------------------------------------------------------------------------
 def main():
+    # 配置合法性守卫：占位符没替换就直接失败，别等全量检测完才发现
+    if "你的域名" in WORKER_CHECK_URL or "YOUR_" in WORKER_CHECK_URL:
+        die("CHECK_WORKER 还是占位符，请在仓库 Secrets 里设置真实的检测 Worker 地址")
     session = requests.Session()
     rows, source = fetch_vpngate()
     raw_count = len(rows)
